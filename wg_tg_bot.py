@@ -29,7 +29,7 @@ OUT_DIR = Path("/root")
 
 # Use your previously generated script path (the resetup script we wrote).
 # It MUST be non-interactive and must resetup the server.
-RESETUP_SCRIPT = "/usr/local/sbin/wg_autosetup.py"
+RESETUP_SCRIPT = "./wg_autosetup.py"
 
 load_dotenv()
 
