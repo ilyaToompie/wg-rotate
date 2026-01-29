@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-Telegram bot: admin-only "Regenerate configs" inline button.
-When pressed: fully resetup WireGuard + generate unique client config for every admin + send to each admin.
-
-Requirements:
-  pip install python-telegram-bot==21.*  (or latest 21.x)
-
-Environment:
-  export TELEGRAM_BOT_TOKEN="123:ABC..."
-
-Run (as root, required for wg/iptables/systemd operations):
-  sudo -E python3 wg_bot.py
-"""
 
 import asyncio
 import os
@@ -21,6 +8,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
+from dotenv import load_dotenv
 
 from telegram import (
     InlineKeyboardButton,
@@ -34,12 +22,6 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
-
-# ----------------------------
-# CONFIG: define admin users
-# ----------------------------
-# Admins are Telegram numeric user IDs.
-# Example: ADMINS = {123456789, 987654321}
 
 WG_NIC = "wg0"
 WG_DIR = Path("/etc/wireguard")
@@ -73,7 +55,7 @@ def load_admins() -> set[int]:
         raise RuntimeError("ADMIN_IDS not set in .env")
     return {int(x.strip()) for x in raw.split(",") if x.strip().isdigit()}
 
-
+ADMINS = load_admins()
 def must_root():
     if os.geteuid() != 0:
         raise RuntimeError("Bot must run as root (wg/iptables/systemd). Run: sudo -E python3 wg_bot.py")
@@ -355,8 +337,6 @@ async def main():
     
     if not token:
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var.")
-
-    ADMINS = load_admins()
 
 
     app = Application.builder().token(token).build()
