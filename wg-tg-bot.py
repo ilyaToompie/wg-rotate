@@ -31,6 +31,8 @@ OUT_DIR = Path("/root")
 # It MUST be non-interactive and must resetup the server.
 RESETUP_SCRIPT = "/usr/local/sbin/wg_autosetup.py"
 
+load_dotenv()
+
 # ----------------------------
 # Concurrency: serialize regen
 # ----------------------------
