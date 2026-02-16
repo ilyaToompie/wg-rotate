@@ -1,4 +1,5 @@
 # WireGuard installer
+# My personal project, for my purposes
 fork of https://github.com/angristan/wireguard-install
 
 quick install/reinstall of wireguard for my server, with random/default settings, then send the result to admins
