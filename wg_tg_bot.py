@@ -8,7 +8,7 @@ import secrets
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -70,7 +70,7 @@ def must_root():
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S") #my local time
 
 
 def log_event(event: str, **fields):
@@ -122,6 +122,7 @@ def read_state() -> dict:
         return {
             "last_regen_ts": None,
             "endpoint": None,
+            "generation_number": None,
             "admin_peers": {},  # admin_id -> {"public_key": "...", "last_handshake": 0, "online": False}
         }
     try:
@@ -130,6 +131,7 @@ def read_state() -> dict:
         return {
             "last_regen_ts": None,
             "endpoint": None,
+            "generation_number": None,
             "admin_peers": {},
         }
 
@@ -380,6 +382,9 @@ async def peer_check_job(context: ContextTypes.DEFAULT_TYPE):
 async def regenerate_and_send(app: Application, requester_id: int):
     must_root()
 
+    state = read_state()
+    state["generation_id"] += 1
+
     server_conf = WG_DIR / f"{WG_NIC}.conf"
     params_file = WG_DIR / "params"
 
@@ -411,7 +416,7 @@ async def regenerate_and_send(app: Application, requester_id: int):
         client_v6 = client_ipv6_from(params.server_wg_ipv6, last)
 
         conf_text = build_client_conf_text(params, client_priv, client_v4, client_v6, psk)
-        out_path = OUT_DIR / f"{WG_NIC}-client-{client_name}.conf"
+        out_path = OUT_DIR / f"{WG_NIC}-client-{client_name}-{state["generation_id"]}.conf"
         write_client_conf(out_path, conf_text)
 
         add_peer_to_server_conf(server_conf, client_name, client_pub, psk, client_v4, client_v6)
