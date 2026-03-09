@@ -451,17 +451,6 @@ async def regenerate_and_send(app: Application, requester_id: int):
 
     log_event("regen_done", requester_id=requester_id, endpoint=endpoint, admins=len(ADMINS), failed=len(failed))
 
-    # Notify requester (always)
-    await app.bot.send_message(
-        chat_id=requester_id,
-        text=(
-            "✅ Regenerated WireGuard configs.\n"
-            f"- Interface: {WG_NIC}\n"
-            f"- Endpoint: {endpoint}\n"
-            f"- Admins: {len(ADMINS)}"
-        ),
-    )
-
     if failed:
         lines = ["⚠️ Could not send to these admins (they must /start the bot first):"]
         for admin_id, err in failed:
