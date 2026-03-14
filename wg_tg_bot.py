@@ -10,20 +10,13 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 from dotenv import load_dotenv
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    Update,
-)
+from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -54,7 +47,7 @@ PEER_CHECK_INTERVAL_SECONDS = int(os.environ.get("PEER_CHECK_INTERVAL_SECONDS", 
 regen_lock = asyncio.Lock()
 
 
-def sh(cmd: List[str], check=True, capture=True) -> subprocess.CompletedProcess:
+def sh(cmd: List[str], check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd,
         check=check,
@@ -70,13 +63,10 @@ def must_root():
 
 
 def now_iso() -> str:
-    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S") #my local time
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def log_event(event: str, **fields):
-    """
-    Append one JSON line to LOG_PATH.
-    """
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     record = {"ts": now_iso(), "event": event, **fields}
     with LOG_PATH.open("a", encoding="utf-8") as f:
@@ -103,7 +93,7 @@ def sanitize_client_name(name: str) -> str:
 
 
 # ----------------------------
-# State (regen info + peer status)
+# State
 # ----------------------------
 @dataclass
 class ServerParams:
@@ -117,23 +107,30 @@ class ServerParams:
     server_wg_ipv6: str
 
 
+def default_state() -> dict:
+    return {
+        "last_regen_ts": None,
+        "endpoint": None,
+        "generation_id": 0,
+        "admin_peers": {},  # admin_id -> {"public_key": "...", "last_handshake": 0, "online": False}
+    }
+
+
 def read_state() -> dict:
     if not STATE_PATH.exists():
-        return {
-            "last_regen_ts": None,
-            "endpoint": None,
-            "generation_number": None,
-            "admin_peers": {},  # admin_id -> {"public_key": "...", "last_handshake": 0, "online": False}
-        }
+        return default_state()
+
     try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return default_state()
+
+        defaults = default_state()
+        for k, v in defaults.items():
+            data.setdefault(k, v)
+        return data
     except Exception:
-        return {
-            "last_regen_ts": None,
-            "endpoint": None,
-            "generation_number": None,
-            "admin_peers": {},
-        }
+        return default_state()
 
 
 def write_state(state: dict):
@@ -194,7 +191,7 @@ def wg_psk() -> str:
     return sh(["wg", "genpsk"]).stdout.strip()
 
 
-def next_client_ipv4(server_ipv4: str, used: set) -> str:
+def next_client_ipv4(server_ipv4: str, used: set[str]) -> str:
     base = ".".join(server_ipv4.split(".")[:3])
     for _ in range(1000):
         dot = secrets.randbelow(253) + 2  # 2..254
@@ -210,7 +207,14 @@ def client_ipv6_from(server_ipv6: str, last: int) -> str:
     return f"{base}::{last}"
 
 
-def add_peer_to_server_conf(server_conf: Path, client_name: str, client_pub: str, psk: str, client_v4: str, client_v6: str):
+def add_peer_to_server_conf(
+    server_conf: Path,
+    client_name: str,
+    client_pub: str,
+    psk: str,
+    client_v4: str,
+    client_v6: str,
+):
     block = (
         f"\n### Client {client_name}\n"
         f"[Peer]\n"
@@ -226,7 +230,13 @@ def sync_wg_conf(wg_nic: str):
     sh(["bash", "-lc", f"wg syncconf {wg_nic} <(wg-quick strip {wg_nic})"], check=True)
 
 
-def build_client_conf_text(params: ServerParams, client_priv: str, client_v4: str, client_v6: str, psk: str) -> str:
+def build_client_conf_text(
+    params: ServerParams,
+    client_priv: str,
+    client_v4: str,
+    client_v6: str,
+    psk: str,
+) -> str:
     endpoint = f"{bracket_if_ipv6(params.server_pub_ip)}:{params.server_port}"
     allowed_ips = params.allowed_ips.replace(",", ", ")
     return (
@@ -243,8 +253,14 @@ def build_client_conf_text(params: ServerParams, client_priv: str, client_v4: st
 
 
 def write_client_conf(out_path: Path, conf_text: str):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(conf_text, encoding="utf-8")
     os.chmod(out_path, 0o600)
+
+
+def random_mobile_conf_name() -> str:
+    # 64 random bytes => 128 hex chars
+    return f"{secrets.token_hex(64)}_mob.conf"
 
 
 def resetup_wireguard_noninteractive():
@@ -254,27 +270,39 @@ def resetup_wireguard_noninteractive():
     sh(["python3", str(p)], check=True)
 
 
-async def send_config_to_admin(bot, admin_id: int, conf_path: Path):
-    conf_text = conf_path.read_text(encoding="utf-8", errors="ignore").strip()
+async def send_config_to_admin(bot, admin_id: int, main_conf_path: Path, mobile_conf_path: Path):
+    main_conf_text = main_conf_path.read_text(encoding="utf-8", errors="ignore").strip()
+    mobile_conf_text = mobile_conf_path.read_text(encoding="utf-8", errors="ignore").strip()
 
-    # Ready-to-paste
     await bot.send_message(
         chat_id=admin_id,
-        text=f"<pre>{conf_text}</pre>",
+        text=f"<b>Main config</b>\n<pre>{main_conf_text}</pre>",
         parse_mode="HTML",
     )
 
-    # .conf file
     await bot.send_document(
         chat_id=admin_id,
-        document=conf_path.open("rb"),
-        filename=conf_path.name,
-        caption=f"WireGuard config file: {conf_path.name}",
+        document=main_conf_path.open("rb"),
+        filename=main_conf_path.name,
+        caption=f"WireGuard config file: {main_conf_path.name}",
+    )
+
+    await bot.send_message(
+        chat_id=admin_id,
+        text=f"<b>Mobile config</b>\n<pre>{mobile_conf_text}</pre>",
+        parse_mode="HTML",
+    )
+
+    await bot.send_document(
+        chat_id=admin_id,
+        document=mobile_conf_path.open("rb"),
+        filename=mobile_conf_path.name,
+        caption=f"WireGuard mobile config file: {mobile_conf_path.name}",
     )
 
 
 # ----------------------------
-# Admin keyboard (permanent)
+# Admin keyboard
 # ----------------------------
 BTN_REGEN = "🔁 Regenerate configs"
 BTN_CHECK = "✅ Check last config update"
@@ -290,11 +318,6 @@ ADMIN_KB = ReplyKeyboardMarkup(
 )
 
 
-def admin_inline_keyboard() -> InlineKeyboardMarkup:
-    # Keep inline too (optional). You can remove this if you only want reply keyboard.
-    return InlineKeyboardMarkup([[InlineKeyboardButton(BTN_REGEN, callback_data="regen_configs")]])
-
-
 # ----------------------------
 # Peer monitoring
 # ----------------------------
@@ -308,12 +331,14 @@ def wg_dump() -> List[dict]:
     r = sh(["wg", "show", WG_NIC, "dump"], check=True, capture=True)
     lines = (r.stdout or "").splitlines()
     peers = []
+
     for i, line in enumerate(lines):
         cols = line.split("\t")
         if i == 0:
             continue
         if len(cols) < 9:
             continue
+
         peers.append(
             {
                 "public_key": cols[0],
@@ -322,19 +347,16 @@ def wg_dump() -> List[dict]:
                 "tx": int(cols[7]) if cols[7].isdigit() else 0,
             }
         )
+
     return peers
 
 
 async def peer_check_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Periodically checks admin peers and logs online->offline transitions.
-    Uses STATE_PATH mapping admin_id -> public_key.
-    """
     try:
         state = read_state()
         admin_peers = state.get("admin_peers", {})
         if not admin_peers:
-            return  # nothing to monitor yet
+            return
 
         peer_rows = wg_dump()
         by_pub = {p["public_key"]: p for p in peer_rows}
@@ -353,16 +375,13 @@ async def peer_check_job(context: ContextTypes.DEFAULT_TYPE):
             was_online = bool(info.get("online", False))
             is_online = (hs > 0) and ((now - hs) <= OFFLINE_AFTER_SECONDS)
 
-            # update stored handshake
             info["last_handshake"] = hs
 
-            # transitions
             if was_online and not is_online:
                 log_event("peer_offline", admin_id=int(admin_id_str), public_key=pub, last_handshake=hs)
                 info["online"] = False
                 changed = True
             elif (not was_online) and is_online:
-                # Optional, but useful
                 log_event("peer_online", admin_id=int(admin_id_str), public_key=pub, last_handshake=hs)
                 info["online"] = True
                 changed = True
@@ -372,7 +391,6 @@ async def peer_check_job(context: ContextTypes.DEFAULT_TYPE):
             write_state(state)
 
     except Exception as e:
-        # Keep bot alive; log internal errors
         log_event("peer_check_error", error=str(e))
 
 
@@ -384,13 +402,14 @@ async def regenerate_and_send(app: Application, requester_id: int):
 
     state = read_state()
     state["generation_id"] += 1
+    generation_id = state["generation_id"]
+    write_state(state)
 
     server_conf = WG_DIR / f"{WG_NIC}.conf"
     params_file = WG_DIR / "params"
 
-    log_event("regen_start", requester_id=requester_id)
+    log_event("regen_start", requester_id=requester_id, generation_id=generation_id)
 
-    # 1) resetup
     resetup_wireguard_noninteractive()
 
     if not server_conf.exists():
@@ -401,9 +420,8 @@ async def regenerate_and_send(app: Application, requester_id: int):
     params = parse_params_file(params_file)
     endpoint = f"{bracket_if_ipv6(params.server_pub_ip)}:{params.server_port}"
 
-    # 2) generate unique clients per admin
-    used_v4 = set()
-    generated: Dict[int, Path] = {}
+    used_v4: set[str] = set()
+    generated: Dict[int, Dict[str, Path]] = {}
     peer_pubkeys: Dict[int, str] = {}
 
     for admin_id in sorted(ADMINS):
@@ -416,19 +434,25 @@ async def regenerate_and_send(app: Application, requester_id: int):
         client_v6 = client_ipv6_from(params.server_wg_ipv6, last)
 
         conf_text = build_client_conf_text(params, client_priv, client_v4, client_v6, psk)
-        out_path = OUT_DIR / f"{WG_NIC}-client-{client_name}-{state["generation_id"]}.conf"
-        write_client_conf(out_path, conf_text)
+
+        main_out_path = OUT_DIR / f"{WG_NIC}-client-{client_name}-{generation_id}.conf"
+        mobile_out_path = OUT_DIR / random_mobile_conf_name()
+
+        write_client_conf(main_out_path, conf_text)
+        write_client_conf(mobile_out_path, conf_text)
 
         add_peer_to_server_conf(server_conf, client_name, client_pub, psk, client_v4, client_v6)
 
-        generated[admin_id] = out_path
+        generated[admin_id] = {
+            "main": main_out_path,
+            "mobile": mobile_out_path,
+        }
         peer_pubkeys[admin_id] = client_pub
 
-    # Apply peers live
     sync_wg_conf(WG_NIC)
 
-    # Update state
     state = read_state()
+    state["generation_id"] = generation_id
     state["last_regen_ts"] = now_iso()
     state["endpoint"] = endpoint
     state["admin_peers"] = {
@@ -441,25 +465,26 @@ async def regenerate_and_send(app: Application, requester_id: int):
     }
     write_state(state)
 
-    # 3) send to admins: message + file, ignore non-started chats but report to requester
     failed: List[Tuple[int, str]] = []
-    for admin_id, path in generated.items():
+
+    for admin_id, paths in generated.items():
         try:
-            await send_config_to_admin(app.bot, admin_id, path)
+            await send_config_to_admin(
+                app.bot,
+                admin_id,
+                main_conf_path=paths["main"],
+                mobile_conf_path=paths["mobile"],
+            )
         except (BadRequest, Forbidden) as e:
             failed.append((admin_id, str(e)))
 
-    log_event("regen_done", requester_id=requester_id, endpoint=endpoint, admins=len(ADMINS), failed=len(failed))
-
-    # Notify requester (always)
-    await app.bot.send_message(
-        chat_id=requester_id,
-        text=(
-            "✅ Regenerated WireGuard configs.\n"
-            f"- Interface: {WG_NIC}\n"
-            f"- Endpoint: {endpoint}\n"
-            f"- Admins: {len(ADMINS)}"
-        ),
+    log_event(
+        "regen_done",
+        requester_id=requester_id,
+        generation_id=generation_id,
+        endpoint=endpoint,
+        admins=len(ADMINS),
+        failed=len(failed),
     )
 
     if failed:
@@ -475,7 +500,6 @@ async def regenerate_and_send(app: Application, requester_id: int):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
-        # Ignore non-admin completely
         return
 
     await update.message.reply_text(
@@ -484,38 +508,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q or not q.from_user:
-        return
-
-    user_id = q.from_user.id
-    if not is_admin(user_id):
-        # Ignore
-        return
-
-    if q.data != "regen_configs":
-        return
-
-    await q.answer("Regenerating…", show_alert=False)
-
-    async with regen_lock:
-        try:
-            await q.edit_message_text("⏳ Regenerating WireGuard configs…")
-            await regenerate_and_send(context.application, requester_id=user_id)
-            await q.edit_message_text("✅ Done. Sent unique configs to all admins.")
-        except Exception as e:
-            msg = f"❌ Failed: {e}"
-            try:
-                await q.edit_message_text(msg)
-            except Exception:
-                await context.application.bot.send_message(chat_id=user_id, text=msg)
-
-
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
-        # ignore non-admin
         return
 
     text = (update.message.text or "").strip()
@@ -533,38 +528,41 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state = read_state()
         last_ts = state.get("last_regen_ts")
         endpoint = state.get("endpoint")
+
         if last_ts and endpoint:
             await update.message.reply_text(
-                f"Last config update:\n- Time (UTC): {last_ts}\n- Endpoint: {endpoint}",
+                f"Last config update:\n- Time (UTC+8): {last_ts}\n- Endpoint: {endpoint}",
                 reply_markup=ADMIN_KB,
             )
         else:
             await update.message.reply_text("No config update recorded yet.", reply_markup=ADMIN_KB)
 
     elif text == BTN_LOGS:
-        # Return last N log lines (JSONL)
-        N = 30
+        n = 30
         if not LOG_PATH.exists():
             await update.message.reply_text("No logs yet.", reply_markup=ADMIN_KB)
             return
 
         lines = LOG_PATH.read_text(encoding="utf-8", errors="ignore").splitlines()
-        tail = lines[-N:]
-        # make it readable (not raw json)
+        tail = lines[-n:]
+
         pretty = []
         for ln in tail:
             try:
                 obj = json.loads(ln)
-                pretty.append(f"{obj.get('ts')} | {obj.get('event')} | {json.dumps({k:v for k,v in obj.items() if k not in ('ts','event')}, ensure_ascii=False)}")
+                payload = {k: v for k, v in obj.items() if k not in ("ts", "event")}
+                pretty.append(f"{obj.get('ts')} | {obj.get('event')} | {json.dumps(payload, ensure_ascii=False)}")
             except Exception:
                 pretty.append(ln)
 
         msg = "\n".join(pretty) if pretty else "No logs yet."
-        # send as <pre> to preserve formatting
-        await update.message.reply_text(f"<pre>{msg}</pre>", parse_mode="HTML", reply_markup=ADMIN_KB)
+        await update.message.reply_text(
+            f"<pre>{msg}</pre>",
+            parse_mode="HTML",
+            reply_markup=ADMIN_KB,
+        )
 
     else:
-        # unknown admin message: no noise, but keep keyboard
         await update.message.reply_text("OK.", reply_markup=ADMIN_KB)
 
 
@@ -580,17 +578,14 @@ async def main():
 
     app = Application.builder().token(token).build()
 
-    # Admin start (non-admin ignored)
     app.add_handler(CommandHandler("start", cmd_start))
-
-    # Inline callback (optional)
-    app.add_handler(CallbackQueryHandler(on_callback))
-
-    # Admin keyboard commands
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
 
-    # Peer monitoring job
-    app.job_queue.run_repeating(peer_check_job, interval=PEER_CHECK_INTERVAL_SECONDS, first=10)
+    app.job_queue.run_repeating(
+        peer_check_job,
+        interval=PEER_CHECK_INTERVAL_SECONDS,
+        first=10,
+    )
 
     log_event("bot_start", admins=len(ADMINS), wg_nic=WG_NIC)
 
