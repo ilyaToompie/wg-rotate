@@ -287,17 +287,11 @@ async def send_config_to_admin(bot, admin_id: int, main_conf_path: Path, mobile_
         caption=f"WireGuard config file: {main_conf_path.name}",
     )
 
-    await bot.send_message(
-        chat_id=admin_id,
-        text=f"<b>Mobile config</b>\n<pre>{mobile_conf_text}</pre>",
-        parse_mode="HTML",
-    )
-
     await bot.send_document(
         chat_id=admin_id,
         document=mobile_conf_path.open("rb"),
         filename=mobile_conf_path.name,
-        caption=f"WireGuard mobile config file: {mobile_conf_path.name}",
+        caption=f"WireGuard mobile config file",
     )
 
 
