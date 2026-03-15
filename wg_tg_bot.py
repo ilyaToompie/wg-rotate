@@ -260,7 +260,7 @@ def write_client_conf(out_path: Path, conf_text: str):
 
 def random_mobile_conf_name() -> str:
     # 64 random bytes => 128 hex chars
-    return f"{secrets.token_hex(64)}_mob.conf"
+    return f"{secrets.token_hex(8)}_mob.conf"
 
 
 def resetup_wireguard_noninteractive():
